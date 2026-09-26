@@ -3055,16 +3055,18 @@ fn provider_model_label(provider: Option<&str>, model: Option<&str>) -> Option<S
 /// OpenCode 2 keeps `session_v2.time_updated` frozen while a session is live
 /// (the same rule the plugin's v87 relabel works around), so the Cache tab's
 /// change gate must read the newest message activity instead — otherwise the
-/// tab stops streaming mid-turn and only refreshes once activity settles.
+/// tab stops streaming mid-turn and only refreshes once activity settles. The
+/// `(session_id, seq)` index makes each latest-message lookup bounded.
 const RECENT_OPENCODE2_CACHE_SESSIONS_SQL: &str = "SELECT s.id,
-       MAX(s.time_updated, COALESCE(m.newest, 0)) AS activity,
+       MAX(s.time_updated, COALESCE((
+         SELECT m.time_updated
+         FROM session_message m
+         WHERE m.session_id = s.id
+         ORDER BY m.seq DESC
+         LIMIT 1
+       ), 0)) AS activity,
        NULLIF(s.title, '')
      FROM session_v2 s
-     LEFT JOIN (
-       SELECT session_id, MAX(time_updated) AS newest
-       FROM session_message
-       GROUP BY session_id
-     ) m ON m.session_id = s.id
      WHERE s.time_archived IS NULL
      ORDER BY activity DESC, s.id DESC
      LIMIT ?1 OFFSET ?2";
@@ -7941,6 +7943,31 @@ mod cache_session_list_query_tests {
         conn
     }
 
+    fn cache_list_v2_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("open OpenCode 2 cache-list DB");
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                time_updated INTEGER NOT NULL,
+                time_archived INTEGER
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX session_message_session_seq_idx
+                ON session_message(session_id, seq);",
+        )
+        .expect("create OpenCode 2 cache-list schema");
+        conn
+    }
+
     fn insert_session(conn: &Connection, id: &str, updated: i64) {
         conn.execute(
             "INSERT INTO session (id, title, time_updated, time_archived)
@@ -7982,16 +8009,53 @@ mod cache_session_list_query_tests {
     }
 
     #[test]
-    fn opencode2_list_query_gates_on_newest_message_activity() {
-        let sql =
-            recent_opencode_cache_sessions_sql(OpenCodeStoreGeneration::V2).to_ascii_lowercase();
-        assert!(sql.contains("from session_v2 s"));
-        assert!(sql.contains("from session_message"));
-        assert!(sql.contains("max(time_updated)"));
-        assert!(sql.contains("order by activity desc"));
-        assert!(sql.contains("time_archived is null"));
-        assert!(sql.contains("limit ?1 offset ?2"));
-        assert!(sql.contains("max(s.time_updated"));
+    fn opencode2_list_query_uses_latest_indexed_message_activity() {
+        let conn = cache_list_v2_db();
+        conn.execute(
+            "INSERT INTO session_v2 (id, title, time_updated, time_archived)
+             VALUES ('live', 'Live session', 100, NULL)",
+            [],
+        )
+        .expect("insert OpenCode 2 session");
+        conn.execute_batch(
+            "INSERT INTO session_message
+                (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES
+                ('first', 'live', 'message', 1, 110, 120, '{}'),
+                ('latest', 'live', 'message', 2, 130, 140, '{}');",
+        )
+        .expect("insert OpenCode 2 messages");
+
+        let sql = recent_opencode_cache_sessions_sql(OpenCodeStoreGeneration::V2);
+        let plan = {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare OpenCode 2 query plan");
+            stmt.query_map(params![10_i64, 0_i64], |row| row.get::<_, String>(3))
+                .expect("explain OpenCode 2 query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read OpenCode 2 query plan")
+        };
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("session_message_session_seq_idx")),
+            "OpenCode 2 message activity should use the per-session sequence index: {plan:?}"
+        );
+
+        let read_activity = || {
+            conn.query_row(&sql, params![10_i64, 0_i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("execute OpenCode 2 cache-session query")
+        };
+        assert_eq!(read_activity(), ("live".to_string(), 140));
+
+        conn.execute(
+            "UPDATE session_message SET time_updated = 250 WHERE id = 'latest'",
+            [],
+        )
+        .expect("advance latest message activity");
+        assert_eq!(read_activity(), ("live".to_string(), 250));
     }
 
     #[test]
@@ -8380,8 +8444,11 @@ mod session_identity_map_tests {
                 type TEXT NOT NULL,
                 seq INTEGER NOT NULL,
                 time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
                 data TEXT NOT NULL
-            );",
+            );
+            CREATE UNIQUE INDEX session_message_session_seq_idx
+                ON session_message(session_id, seq);",
         )
         .expect("create opencode 2 schema");
         conn

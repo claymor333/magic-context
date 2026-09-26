@@ -369,12 +369,14 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
   // only those rows once per second instead of repeatedly reloading the full
   // session history.
   const [liveMeta, setLiveMeta] = createSignal<SessionMetaRow | null>(null);
+  const [liveStatsFresh, setLiveStatsFresh] = createSignal(false);
   const [liveTokenBreakdown, setLiveTokenBreakdown] =
     createSignal<Awaited<ReturnType<typeof getContextTokenBreakdown>>>(null);
 
   createEffect(() => {
     const selected = selectedSession();
     setLiveMeta(null);
+    setLiveStatsFresh(false);
     setLiveTokenBreakdown(null);
     if (!selected) return;
 
@@ -390,9 +392,11 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
         ]);
         if (!stopped) {
           setLiveMeta(meta);
+          setLiveStatsFresh(true);
           setLiveTokenBreakdown(breakdown);
         }
       } catch {
+        if (!stopped) setLiveStatsFresh(false);
         // Keep the last successful values visible through transient SQLite/IPC
         // contention while the next tick retries.
       } finally {
@@ -1819,12 +1823,14 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                     <tr>
                       <td>
                         Context %{" "}
-                        <span
-                          class="pill green"
-                          style={{ "font-size": "9px", "line-height": "1.3" }}
-                        >
-                          LIVE
-                        </span>
+                        <Show when={liveStatsFresh() && liveMeta()}>
+                          <span
+                            class="pill green"
+                            style={{ "font-size": "9px", "line-height": "1.3" }}
+                          >
+                            LIVE
+                          </span>
+                        </Show>
                       </td>
                       <td>{metaData().last_context_percentage.toFixed(1)}%</td>
                     </tr>
